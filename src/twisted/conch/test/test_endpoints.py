@@ -7,7 +7,7 @@ Tests for L{twisted.conch.endpoints}.
 
 import os.path
 from io import BytesIO
-from struct import pack
+from struct import error as structError, pack
 from typing import IO
 
 from zope.interface import implementer
@@ -43,18 +43,23 @@ from twisted.python.reflect import requireModule
 from twisted.trial.unittest import TestCase
 
 if requireModule("cryptography"):
+    from cryptography.hazmat.primitives.asymmetric import ec
+
     from twisted.conch.avatar import ConchUser
     from twisted.conch.checkers import InMemorySSHKeyDB, SSHPublicKeyChecker
     from twisted.conch.client.knownhosts import ConsoleUI, KnownHostsFile
     from twisted.conch.endpoints import (
+        _HOST_KEYS_EXTENSION,
+        _HOST_KEYS_PROVE_EXTENSION,
         AuthenticationFailed,
         SSHCommandAddress,
         SSHCommandClientEndpoint,
         _ExistingConnectionHelper,
+        _HostKeyRotatingConnection,
         _ISSHConnectionCreator,
         _NewConnectionHelper,
     )
-    from twisted.conch.ssh import common
+    from twisted.conch.ssh import common, connection
     from twisted.conch.ssh.agent import SSHAgentServer
     from twisted.conch.ssh.channel import SSHChannel
     from twisted.conch.ssh.connection import SSHConnection
@@ -62,8 +67,11 @@ if requireModule("cryptography"):
     from twisted.conch.ssh.keys import Key
     from twisted.conch.ssh.transport import SSHClientTransport
     from twisted.conch.ssh.userauth import SSHUserAuthServer
+    from twisted.conch.test import test_userauth
     from twisted.conch.test.keydata import (
         privateDSA_openssh,
+        privateECDSA_openssh,
+        privateEd25519_openssh_new,
         privateRSA_openssh,
         privateRSA_openssh_encrypted_aes,
         publicRSA_openssh,
@@ -222,6 +230,97 @@ class CommandFactory(SSHFactory):
     # and failure.  There is an off-by-one in the implementation of this
     # feature in Conch, so set it to 0 in order to allow 1 attempt.
     attemptsBeforeDisconnect = 0
+
+
+class _HostKeyRotatingServerConnection(SSHConnection):
+    """
+    An SSH I{connection} service for the test server which announces an
+    additional host key through the C{hostkeys-00@openssh.com} extension and
+    answers possession proofs for it.
+    """
+
+    def serviceStarted(self):
+        SSHConnection.serviceStarted(self)
+        rotationKey = self.transport.factory.rotationKey
+        self.sendGlobalRequest(
+            _HOST_KEYS_EXTENSION,
+            common.NS(rotationKey.public().blob()),
+            0,
+        )
+
+    def gotGlobalRequest(self, requestType, data):
+        if requestType == _HOST_KEYS_PROVE_EXTENSION:
+            hostKeyBlob, _rest = common.getNS(data)
+            rotationKey = self.transport.factory.rotationKey
+            sessionID = self.transport.sessionID
+            signature = rotationKey.sign(
+                common.NS(_HOST_KEYS_PROVE_EXTENSION)
+                + common.NS(sessionID)
+                + common.NS(hostKeyBlob)
+            )
+            return 1, common.NS(signature)
+        return SSHConnection.gotGlobalRequest(self, requestType, data)
+
+
+class _ForgingHostKeyRotatingServerConnection(_HostKeyRotatingServerConnection):
+    """
+    A variant which answers possession proofs using a key unrelated to the
+    advertised one, simulating a forged proof.
+    """
+
+    def gotGlobalRequest(self, requestType, data):
+        if requestType == _HOST_KEYS_PROVE_EXTENSION:
+            hostKeyBlob, _rest = common.getNS(data)
+            forgingKey = self.transport.factory.forgingKey
+            sessionID = self.transport.sessionID
+            signature = forgingKey.sign(
+                common.NS(_HOST_KEYS_PROVE_EXTENSION)
+                + common.NS(sessionID)
+                + common.NS(hostKeyBlob)
+            )
+            return 1, common.NS(signature)
+        return SSHConnection.gotGlobalRequest(self, requestType, data)
+
+
+class HostKeyRotationCommandFactory(CommandFactory):
+    """
+    A server factory which announces an ECDSA key in addition to its RSA key
+    and proves possession of it when asked.
+    """
+
+    rotationKey = Key.fromString(privateECDSA_openssh)
+    forgingKey = Key.fromString(privateDSA_openssh)
+
+    services = {
+        b"ssh-userauth": FakeClockSSHUserAuthServer,
+        b"ssh-connection": _HostKeyRotatingServerConnection,
+    }
+
+
+class ForgingHostKeyRotationCommandFactory(HostKeyRotationCommandFactory):
+    """
+    A server factory whose proof of possession is always forged.
+    """
+
+    services = {
+        b"ssh-userauth": FakeClockSSHUserAuthServer,
+        b"ssh-connection": _ForgingHostKeyRotatingServerConnection,
+    }
+
+
+class RotatedHostKeyCommandFactory(HostKeyRotationCommandFactory):
+    """
+    A server factory which only presents the rotated (ECDSA) host key, as a
+    server would after completing a key rotation.
+    """
+
+    @property
+    def publicKeys(self):
+        return {self.rotationKey.sshType(): self.rotationKey.public()}
+
+    @property
+    def privateKeys(self):
+        return {self.rotationKey.sshType(): self.rotationKey}
 
 
 @implementer(IAddress)
@@ -1305,6 +1404,108 @@ class NewConnectionTests(TestCase, SSHCommandClientEndpointTestsMixin):
         # endpoint should close it.
         self.assertTrue(client.transport.disconnecting)
 
+    def _connectToRotatingFactory(self, serverFactory, tcpClientIndex=0):
+        """
+        Connect an L{SSHCommandClientEndpoint} using the given server factory
+        through the in-memory transport pair.
+
+        @param serverFactory: The SSH server factory to connect to.
+
+        @param tcpClientIndex: The index of the reactor's pending client
+            connection to use.
+
+        @return: A L{tuple} of the server protocol, the client protocol, the
+            L{IOPump} connecting them and the L{Deferred} from connecting the
+            endpoint.
+        """
+        serverFactory.reactor = self.reactor
+        serverFactory.portal = self.portal
+        serverFactory.doStart()
+        self.addCleanup(serverFactory.doStop)
+        self.realm.channelLookup[b"session"] = WorkingExecSession
+
+        endpoint = SSHCommandClientEndpoint.newConnection(
+            self.reactor,
+            b"/bin/ls -l",
+            self.user,
+            self.hostname,
+            self.port,
+            password=self.password,
+            knownHosts=self.knownHosts,
+            ui=FixedResponseUI(False),
+        )
+        connected = endpoint.connect(Factory.forProtocol(Protocol))
+        server, client, pump = self.connectedServerAndClient(
+            serverFactory, self.reactor.tcpClients[tcpClientIndex][2]
+        )
+        return server, client, pump, connected
+
+    def test_hostKeyRotationLearnsAndTrustsRotatedKey(self):
+        """
+        A host key advertised through C{hostkeys-00@openssh.com} is saved to
+        the known hosts file once the server proves possession of its private
+        half, so a later connection where the server only presents the
+        rotated key is trusted without prompting.
+        """
+        factory = HostKeyRotationCommandFactory()
+        server, client, pump, connected = self._connectToRotatingFactory(factory)
+        self.assertIsNotNone(self.successResultOf(connected).transport)
+
+        rotatedKey = factory.rotationKey.public()
+        learned = False
+        for _ in range(20):
+            if self.knownHosts.hasHostKey(self.hostname, rotatedKey):
+                learned = True
+                break
+            pump.pump()
+        self.assertTrue(learned)
+
+        # The rotated key was persisted for both the hostname and the IP,
+        # while the original trusted record is untouched.
+        reloaded = KnownHostsFile.fromPath(self.hostKeyPath)
+        self.assertTrue(reloaded.hasHostKey(self.hostname, rotatedKey))
+        self.assertTrue(
+            reloaded.hasHostKey(networkString(self.serverAddress.host), rotatedKey)
+        )
+        self.assertTrue(
+            reloaded.hasHostKey(self.hostname, self.factory.publicKeys[b"ssh-rsa"])
+        )
+
+        # A server that has completed the rotation and now presents only the
+        # ECDSA key is trusted from the learned record.  The UI rejects every
+        # prompt, so any unknown key would fail the connection.
+        rotatedFactory = RotatedHostKeyCommandFactory()
+        (
+            rotatedServer,
+            rotatedClient,
+            rotatedPump,
+            rotatedConnected,
+        ) = self._connectToRotatingFactory(rotatedFactory, tcpClientIndex=1)
+        protocol = self.successResultOf(rotatedConnected)
+        self.assertIsNotNone(protocol.transport)
+
+    def test_forgedHostKeyProofDoesNotChangeKnownHosts(self):
+        """
+        An advertised key whose proof of possession is invalid is discarded,
+        the known hosts file keeps only its original records, and the command
+        connection still completes successfully.
+        """
+        factory = ForgingHostKeyRotationCommandFactory()
+        server, client, pump, connected = self._connectToRotatingFactory(factory)
+        protocol = self.successResultOf(connected)
+        self.assertIsNotNone(protocol.transport)
+
+        rotatedKey = factory.rotationKey.public()
+        for _ in range(10):
+            pump.pump()
+        self.assertFalse(self.knownHosts.hasHostKey(self.hostname, rotatedKey))
+
+        reloaded = KnownHostsFile.fromPath(self.hostKeyPath)
+        self.assertFalse(reloaded.hasHostKey(self.hostname, rotatedKey))
+        self.assertTrue(
+            reloaded.hasHostKey(self.hostname, self.factory.publicKeys[b"ssh-rsa"])
+        )
+
 
 class ExistingConnectionTests(TestCase, SSHCommandClientEndpointTestsMixin):
     """
@@ -1613,3 +1814,333 @@ class NewConnectionHelperTests(TestCase):
         connection.transport.transport = Abortable()
         helper.cleanupConnection(connection, True)
         self.assertTrue(connection.transport.transport.aborted)
+
+
+class _FakeInnerTransport:
+    """
+    A stand-in for the byte-stream transport underneath the SSH transport,
+    only able to report a peer address.
+    """
+
+    def __init__(self, host):
+        self._host = host
+
+    def getPeer(self):
+        return IPv4Address("TCP", self._host, 22)
+
+
+class _FakeCreator:
+    """
+    A stand-in for L{_NewConnectionHelper} exposing what
+    L{_HostKeyRotatingConnection} needs.
+    """
+
+    def __init__(self, hostname, knownHosts):
+        self.hostname = hostname
+        self.knownHosts = knownHosts
+
+
+class HostKeyRotatingConnectionTests(TestCase):
+    """
+    Unit tests for L{_HostKeyRotatingConnection}.
+    """
+
+    HOSTNAME = b"ssh.example.com"
+    IP = b"192.168.100.200"
+    SESSION_ID = b"a-fixed-session-identifier"
+
+    def setUp(self):
+        self.currentKey = Key.fromString(privateRSA_openssh)
+        self.newKey = Key.fromString(privateECDSA_openssh)
+        self.otherNewKey = Key.fromString(privateEd25519_openssh_new)
+        # A distinct key of the same type as newKey, to simulate a conflict.
+        self.conflictingKey = Key(ec.generate_private_key(ec.SECP256R1()))
+        self.forgingKey = Key.fromString(privateDSA_openssh)
+
+        self.hostKeyPath = FilePath(self.mktemp())
+        self.knownHosts = KnownHostsFile(self.hostKeyPath)
+        self.knownHosts.addHostKey(self.HOSTNAME, self.currentKey.public())
+        self.knownHosts.addHostKey(self.IP, self.currentKey.public())
+        self.knownHosts.save()
+        # Re-open the file the same way the endpoint does, so saves append.
+        self.knownHosts = KnownHostsFile.fromPath(self.hostKeyPath)
+
+        self.transport = test_userauth.FakeTransport(None)
+        self.transport.sessionID = self.SESSION_ID
+        self.transport.creator = _FakeCreator(self.HOSTNAME, self.knownHosts)
+        self.transport.transport = _FakeInnerTransport(self.IP.decode("ascii"))
+
+        self.connection = _HostKeyRotatingConnection(Deferred())
+        self.connection.transport = self.transport
+        self.connection.serviceStarted()
+
+    def _announce(self, *blobs):
+        """
+        Deliver a C{hostkeys-00@openssh.com} announcement to the connection
+        service.
+        """
+        self.connection.ssh_GLOBAL_REQUEST(
+            common.NS(_HOST_KEYS_EXTENSION)
+            + b"\x00"
+            + b"".join(common.NS(blob) for blob in blobs)
+        )
+
+    def _proveRequestPacket(self, blob):
+        """
+        Build the exact C{hostkeys-prove-00@openssh.com} packet expected to be
+        sent for the given key blob.
+        """
+        return (
+            connection.MSG_GLOBAL_REQUEST,
+            common.NS(_HOST_KEYS_PROVE_EXTENSION) + b"\xff" + common.NS(blob),
+        )
+
+    def _signature(self, key, blob):
+        """
+        Produce a proof signature with the given key over the protocol-defined
+        signed data.
+        """
+        return key.sign(
+            common.NS(_HOST_KEYS_PROVE_EXTENSION)
+            + common.NS(self.SESSION_ID)
+            + common.NS(blob)
+        )
+
+    def _replyWithProof(self, signature):
+        """
+        Deliver a successful proof reply containing the given signature.
+        """
+        self.connection.ssh_REQUEST_SUCCESS(common.NS(signature))
+
+    def assertRecordsUnchanged(self, before):
+        """
+        Assert no entry was added in memory or persisted to the known hosts
+        file.
+        """
+        self.assertEqual(self.knownHosts._added, [])
+        self.assertEqual(self.hostKeyPath.getContent(), before)
+
+    def test_validProofAddsAdvertisedKey(self):
+        """
+        An advertised key with a valid proof of possession is saved for both
+        the hostname and the peer IP, alongside the pre-existing records.
+        """
+        blob = self.newKey.public().blob()
+        before = self.hostKeyPath.getContent()
+
+        self._announce(blob)
+        self.assertEqual(self.transport.packets, [self._proveRequestPacket(blob)])
+
+        self._replyWithProof(self._signature(self.newKey, blob))
+
+        self.assertTrue(self.knownHosts.hasHostKey(self.HOSTNAME, self.newKey.public()))
+        self.assertTrue(self.knownHosts.hasHostKey(self.IP, self.newKey.public()))
+
+        reloaded = KnownHostsFile.fromPath(self.hostKeyPath)
+        self.assertTrue(reloaded.hasHostKey(self.HOSTNAME, self.newKey.public()))
+        self.assertTrue(reloaded.hasHostKey(self.IP, self.newKey.public()))
+        # The original trusted key is still present.
+        self.assertTrue(reloaded.hasHostKey(self.HOSTNAME, self.currentKey.public()))
+        self.assertNotEqual(before, self.hostKeyPath.getContent())
+
+    def test_multipleAdvertisedKeysEachGetAProof(self):
+        """
+        Every unknown advertised key triggers its own proof request and every
+        validated one is learned.
+        """
+        ecdsaBlob = self.newKey.public().blob()
+        ed25519Blob = self.otherNewKey.public().blob()
+
+        self._announce(ecdsaBlob, ed25519Blob)
+        self.assertEqual(
+            self.transport.packets,
+            [
+                self._proveRequestPacket(ecdsaBlob),
+                self._proveRequestPacket(ed25519Blob),
+            ],
+        )
+
+        self._replyWithProof(self._signature(self.newKey, ecdsaBlob))
+        self._replyWithProof(self._signature(self.otherNewKey, ed25519Blob))
+
+        self.assertTrue(self.knownHosts.hasHostKey(self.HOSTNAME, self.newKey.public()))
+        self.assertTrue(
+            self.knownHosts.hasHostKey(self.HOSTNAME, self.otherNewKey.public())
+        )
+
+    def test_alreadyTrustedKeyNeedsNoProof(self):
+        """
+        An advertised key which is already trusted for the hostname does not
+        cause a proof request or any file change.
+        """
+        blob = self.newKey.public().blob()
+        self.knownHosts.addHostKey(self.HOSTNAME, self.newKey.public())
+        self.knownHosts.save()
+        before = self.hostKeyPath.getContent()
+
+        self._announce(blob)
+
+        self.assertEqual(self.transport.packets, [])
+        self.assertEqual(self.hostKeyPath.getContent(), before)
+
+    def test_forgedProofDoesNotChangeRecords(self):
+        """
+        A proof signature produced by a key other than the advertised one is
+        rejected without touching the known hosts records.
+        """
+        blob = self.newKey.public().blob()
+        before = self.hostKeyPath.getContent()
+
+        self._announce(blob)
+        self._replyWithProof(self._signature(self.forgingKey, blob))
+
+        self.assertFalse(
+            self.knownHosts.hasHostKey(self.HOSTNAME, self.newKey.public())
+        )
+        self.assertRecordsUnchanged(before)
+
+    def test_malformedProofDoesNotChangeRecords(self):
+        """
+        A proof reply which does not contain a parseable signature is
+        rejected without touching the known hosts records.
+        """
+        blob = self.newKey.public().blob()
+        before = self.hostKeyPath.getContent()
+
+        self._announce(blob)
+        self.connection.ssh_REQUEST_SUCCESS(common.NS(b"not a signature blob"))
+
+        self.assertFalse(
+            self.knownHosts.hasHostKey(self.HOSTNAME, self.newKey.public())
+        )
+        self.assertRecordsUnchanged(before)
+
+    def test_unparseableProofDoesNotChangeRecords(self):
+        """
+        A proof reply whose signature cannot even be parsed is rejected
+        without touching the known hosts records.
+        """
+        blob = self.newKey.public().blob()
+        before = self.hostKeyPath.getContent()
+
+        self._announce(blob)
+        # A signature shorter than its 4-byte length header makes getNS raise.
+        self.connection.ssh_REQUEST_SUCCESS(common.NS(b"abc"))
+
+        self.assertFalse(
+            self.knownHosts.hasHostKey(self.HOSTNAME, self.newKey.public())
+        )
+        self.assertRecordsUnchanged(before)
+        self.assertEqual(1, len(self.flushLoggedErrors(structError)))
+
+    def test_refusedProofDoesNotChangeRecords(self):
+        """
+        If the server refuses the proof request, the advertised key is
+        discarded without touching the known hosts records.
+        """
+        blob = self.newKey.public().blob()
+        before = self.hostKeyPath.getContent()
+
+        self._announce(blob)
+        self.connection.ssh_REQUEST_FAILURE(b"")
+
+        self.assertFalse(
+            self.knownHosts.hasHostKey(self.HOSTNAME, self.newKey.public())
+        )
+        self.assertRecordsUnchanged(before)
+
+    def test_unsupportedAlgorithmIsIgnored(self):
+        """
+        An advertised key using an unknown algorithm neither triggers a proof
+        request nor changes the known hosts records.
+        """
+        blob = common.NS(b"ssh-not-a-real-algorithm") + b"abc"
+        before = self.hostKeyPath.getContent()
+
+        self._announce(blob)
+
+        self.assertEqual(self.transport.packets, [])
+        self.assertRecordsUnchanged(before)
+
+    def test_conflictingAdvertisedKeyIsIgnored(self):
+        """
+        An advertised key which conflicts with an already trusted key of the
+        same type is not proved and never replaces the existing record.
+        """
+        # The conflicting key uses the same sshType but is a different key.
+        self.assertEqual(self.conflictingKey.sshType(), self.newKey.sshType())
+        self.assertNotEqual(
+            self.conflictingKey.public().blob(), self.newKey.public().blob()
+        )
+        self.knownHosts.addHostKey(self.HOSTNAME, self.conflictingKey.public())
+        self.knownHosts.save()
+        before = self.hostKeyPath.getContent()
+
+        self._announce(self.newKey.public().blob())
+
+        self.assertEqual(self.transport.packets, [])
+        self.assertRecordsUnchanged(before)
+
+    def test_saveFailureRollsBack(self):
+        """
+        If persisting the validated key fails, the in-memory pending entries
+        are rolled back and the known hosts file keeps its original content.
+        """
+        blob = self.newKey.public().blob()
+        before = self.hostKeyPath.getContent()
+
+        def failSave():
+            raise OSError("simulated write failure")
+
+        self.patch(self.knownHosts, "save", failSave)
+
+        self._announce(blob)
+        self._replyWithProof(self._signature(self.newKey, blob))
+
+        self.assertFalse(
+            self.knownHosts.hasHostKey(self.HOSTNAME, self.newKey.public())
+        )
+        self.assertRecordsUnchanged(before)
+        # The save failure is logged rather than allowed to break the
+        # connection.
+        self.assertEqual(1, len(self.flushLoggedErrors(OSError)))
+
+    def test_ipConflictAtSaveTimeRollsBack(self):
+        """
+        A conflict discovered while adding the peer IP entry rolls back the
+        hostname entry added moments earlier, leaving every record unchanged.
+        """
+        # An ECDSA key is already trusted for the IP but not the hostname.
+        self.knownHosts.addHostKey(self.IP, self.conflictingKey.public())
+        self.knownHosts.save()
+        before = self.hostKeyPath.getContent()
+
+        blob = self.newKey.public().blob()
+        self._announce(blob)
+        self._replyWithProof(self._signature(self.newKey, blob))
+
+        self.assertFalse(
+            self.knownHosts.hasHostKey(self.HOSTNAME, self.newKey.public())
+        )
+        self.assertRecordsUnchanged(before)
+
+    def test_malformedAnnouncementIsIgnored(self):
+        """
+        A truncated announcement does not raise and produces no proof
+        requests or record changes.
+        """
+        before = self.hostKeyPath.getContent()
+
+        self.connection.ssh_GLOBAL_REQUEST(
+            common.NS(_HOST_KEYS_EXTENSION) + b"\x00" + b"\x00\x00\x00\x10x"
+        )
+
+        self.assertEqual(self.transport.packets, [])
+        self.assertRecordsUnchanged(before)
+
+    def test_otherGlobalRequestsAreDispatchedNormally(self):
+        """
+        Global requests unrelated to host-key rotation keep the default
+        L{SSHConnection} behavior.
+        """
+        self.assertEqual(0, self.connection.gotGlobalRequest(b"tcpip-forward", b""))

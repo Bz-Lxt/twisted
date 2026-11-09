@@ -15,20 +15,22 @@ __all__ = [
 ]
 
 import signal
+import struct
 from io import BytesIO
 from os.path import expanduser
 from struct import unpack
-from typing import IO, Any
+from typing import IO, Any, cast
 
 from zope.interface import Interface, implementer
 
 from twisted.conch.client.agent import SSHAgentClient
 from twisted.conch.client.default import _KNOWN_HOSTS
 from twisted.conch.client.knownhosts import ConsoleUI, KnownHostsFile
+from twisted.conch.error import HostKeyChanged
 from twisted.conch.ssh.channel import SSHChannel
 from twisted.conch.ssh.common import NS, getNS
 from twisted.conch.ssh.connection import SSHConnection
-from twisted.conch.ssh.keys import Key
+from twisted.conch.ssh.keys import BadKeyError, Key
 from twisted.conch.ssh.transport import SSHClientTransport
 from twisted.conch.ssh.userauth import SSHUserAuthClient
 from twisted.internet.address import IPv4Address, IPv6Address
@@ -52,6 +54,13 @@ class AuthenticationFailed(Exception):
     An SSH session could not be established because authentication was not
     successful.
     """
+
+
+# OpenSSH host-key update and rotation extension, described in the
+# hostkeys-00@openssh.com section of the OpenSSH PROTOCOL file and in
+# draft-ietf-sshm-hostkey-update.
+_HOST_KEYS_EXTENSION = b"hostkeys-00@openssh.com"
+_HOST_KEYS_PROVE_EXTENSION = b"hostkeys-prove-00@openssh.com"
 
 
 # This should be public.  See #6541.
@@ -292,6 +301,205 @@ class _ConnectionReady(SSHConnection):
         del self._ready
 
 
+class _HostKeyRotatingConnection(_ConnectionReady):
+    """
+    L{_HostKeyRotatingConnection} extends L{_ConnectionReady} with support
+    for the OpenSSH C{hostkeys-00@openssh.com} host-key update and rotation
+    extension.
+
+    The service only runs after the server's host key used for the
+    connection itself has been verified against the L{KnownHostsFile}, so
+    every advertised key is learned through a chain of trust rooted in that
+    key.  An advertised key is added only once the server has proved
+    possession of its private half by returning a valid signature in reply
+    to a C{hostkeys-prove-00@openssh.com} request.  Advertised keys using an
+    unsupported algorithm, keys whose proof is invalid, keys which conflict
+    with existing records, and keys which cannot be persisted are discarded
+    without modifying any existing record.
+    """
+
+    _log = Logger()
+
+    @property
+    def _commandTransport(self) -> "_CommandTransport":
+        """
+        The L{_CommandTransport} running this connection service.
+
+        The service is only ever attached to an L{_CommandTransport} by
+        L{_CommandTransport.connectionSecure}.
+        """
+        transport = self.transport
+        assert transport is not None
+        return cast("_CommandTransport", transport)
+
+    def gotGlobalRequest(self, requestType: bytes, data: bytes) -> int:
+        """
+        Intercept host-key rotation announcements; dispatch every other
+        global request using the normal L{SSHConnection} behavior.
+
+        @param requestType: The type of the global request.
+
+        @param data: The request-specific data.
+
+        @return: C{0} for a host-key rotation announcement (which never
+            requests a reply), otherwise the result of the base
+            implementation.
+        """
+        if requestType == _HOST_KEYS_EXTENSION:
+            self._hostKeysAnnounced(data)
+            return 0
+        return cast(int, _ConnectionReady.gotGlobalRequest(self, requestType, data))
+
+    def _hostKeysAnnounced(self, data: bytes) -> None:
+        """
+        Handle the list of host keys advertised by the server.
+
+        @param data: The concatenated SSH strings of the advertised public
+            key blobs.
+        """
+        while data:
+            try:
+                hostKeyBlob, data = getNS(data)
+            except struct.error:
+                self._log.debug(
+                    "Discarding malformed {extension} message",
+                    extension=_HOST_KEYS_EXTENSION,
+                )
+                return
+            self._requestHostKeyProof(hostKeyBlob)
+
+    def _requestHostKeyProof(self, hostKeyBlob: bytes) -> None:
+        """
+        Ask the server to prove possession of the private part of an
+        advertised host key, unless the key is already trusted or conflicts
+        with a trusted record.
+
+        @param hostKeyBlob: The advertised public key blob.
+        """
+        try:
+            hostKey = Key.fromString(hostKeyBlob)
+        except (BadKeyError, ValueError, struct.error):
+            self._log.info(
+                "Ignoring advertised host key using an unsupported or"
+                " malformed key algorithm"
+            )
+            return
+
+        commandTransport = self._commandTransport
+        knownHosts = commandTransport.creator.knownHosts
+        hostname = commandTransport.creator.hostname
+        try:
+            alreadyKnown = knownHosts.hasHostKey(hostname, hostKey)
+        except HostKeyChanged:
+            self._log.info(
+                "Ignoring advertised host key which conflicts with an"
+                " existing known-hosts record for {hostname!r}",
+                hostname=hostname,
+            )
+            return
+        if alreadyKnown:
+            return
+
+        proof = self.sendGlobalRequest(
+            _HOST_KEYS_PROVE_EXTENSION, NS(hostKeyBlob), wantReply=True
+        )
+        proof.addCallbacks(
+            self._hostKeyProofReceived,
+            self._hostKeyProofFailed,
+            callbackArgs=(hostKeyBlob, hostKey),
+            errbackArgs=(hostKeyBlob,),
+        )
+
+    def _hostKeyProofReceived(
+        self, reply: bytes, hostKeyBlob: bytes, hostKey: Key
+    ) -> None:
+        """
+        Verify the signature returned by the server for an advertised key
+        and persist the key when the proof of possession is valid.
+
+        @param reply: The payload of the C{SSH_MSG_REQUEST_SUCCESS} reply.
+
+        @param hostKeyBlob: The advertised public key blob.
+
+        @param hostKey: The parsed advertised public key.
+        """
+        try:
+            signature, _remaining = getNS(reply)
+        except struct.error:
+            self._log.info("Discarding malformed host-key proof reply")
+            return
+
+        sessionID = self._commandTransport.sessionID
+        assert sessionID is not None, "session ID must already have been assigned"
+        signedData = NS(_HOST_KEYS_PROVE_EXTENSION) + NS(sessionID) + NS(hostKeyBlob)
+        try:
+            valid = hostKey.verify(signature, signedData)
+        except (ValueError, struct.error):
+            self._log.failure("Host-key proof could not be verified")
+            valid = False
+        if not valid:
+            self._log.info(
+                "Discarding advertised host key because its proof of"
+                " possession is invalid"
+            )
+            return
+        self._saveVerifiedHostKey(hostKey)
+
+    def _hostKeyProofFailed(self, failure: Failure, hostKeyBlob: bytes) -> None:
+        """
+        Handle a refused or failed host-key proof request by discarding the
+        advertised key.
+
+        @param failure: The failure describing why the proof request failed.
+
+        @param hostKeyBlob: The advertised public key blob.
+        """
+        self._log.info(
+            "Server did not prove possession of advertised host key"
+            " {hostKeyBlob!r}: {reason}",
+            hostKeyBlob=hostKeyBlob,
+            reason=failure.getErrorMessage(),
+        )
+
+    def _saveVerifiedHostKey(self, hostKey: Key) -> None:
+        """
+        Add a successfully proved host key to the L{KnownHostsFile} and
+        persist it.  Any conflict or save failure rolls back the entries
+        added here so that pre-existing records are never altered.
+
+        @param hostKey: The advertised public key whose proof of possession
+            has been verified.
+        """
+        commandTransport = self._commandTransport
+        creator = commandTransport.creator
+        knownHosts = creator.knownHosts
+        hostname = creator.hostname
+        innerTransport = commandTransport.transport
+        assert innerTransport is not None
+        peer = innerTransport.getPeer()
+        assert isinstance(peer, (IPv4Address, IPv6Address))
+        ip = peer.host.encode("ascii")
+
+        # Snapshot the pending entries so every entry appended by this method
+        # can be removed again if a later check or the save fails.
+        pendingBefore = list(knownHosts._added)
+        try:
+            if not knownHosts.hasHostKey(hostname, hostKey):
+                knownHosts.addHostKey(hostname, hostKey)
+            if not knownHosts.hasHostKey(ip, hostKey):
+                knownHosts.addHostKey(ip, hostKey)
+            knownHosts.save()
+        except HostKeyChanged:
+            knownHosts._added = pendingBefore
+            self._log.info(
+                "Not adding advertised host key because it conflicts with an"
+                " existing known-hosts record"
+            )
+        except OSError:
+            knownHosts._added = pendingBefore
+            self._log.failure("Unable to save the updated known hosts file")
+
+
 class _UserAuth(SSHUserAuthClient):
     """
     L{_UserAuth} implements the client part of SSH user authentication in the
@@ -485,7 +693,7 @@ class _CommandTransport(SSHClientTransport):
         """
         self._state = b"AUTHENTICATING"
 
-        command = _ConnectionReady(self.connectionReady)
+        command = _HostKeyRotatingConnection(self.connectionReady)
 
         self._userauth = _UserAuth(self.creator.username, command)
         self._userauth.password = self.creator.password
