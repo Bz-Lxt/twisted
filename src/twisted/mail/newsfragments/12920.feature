@@ -1,0 +1,1 @@
+twisted.mail.imap4.IMAP4Client and twisted.mail.imap4.IMAP4Server now implement the IMAP COMPRESS=DEFLATE extension (RFC 4978), negotiating the COMPRESS command in the authenticated state and seamlessly switching both directions to raw DEFLATE compression while preserving buffered data, literals, ordering, and producer backpressure.

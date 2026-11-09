@@ -26,6 +26,7 @@ import string
 import tempfile
 import time
 import uuid
+import zlib
 from base64 import decodebytes, encodebytes
 from io import BytesIO
 from itertools import chain
@@ -575,6 +576,185 @@ class Command:
             unusedCallback(unuse)
 
 
+@implementer(interfaces.ITransport, interfaces.IConsumer)
+class _DeflateTransport:
+    """
+    Write-side transport wrapper implementing the DEFLATE mechanism of
+    the IMAP COMPRESS extension (RFC 4978).
+
+    Data written to this transport is compressed with a raw DEFLATE
+    stream and written to the wrapped transport.  One compressor object
+    is shared by every L{write} and L{writeSequence} call, so the
+    compression dictionary and the ordering of the octets are
+    preserved.
+
+    Decompression of incoming data is handled by L{_CompressionMixin}
+    on the protocol itself, since the underlying transport delivers
+    received data by calling the protocol's C{dataReceived} method.
+    """
+
+    def __init__(self, transport, level=zlib.Z_DEFAULT_COMPRESSION):
+        self._transport = transport
+        # Negative window bits select the header-less raw DEFLATE
+        # format required by section 4 of RFC 4978.
+        self._compressor = zlib.compressobj(level, zlib.DEFLATED, -15)
+
+    def write(self, data):
+        """
+        Compress C{data} and write it to the wrapped transport.
+
+        The stream is flushed with Z_SYNC_FLUSH after every write so the
+        receiving side can parse complete IMAP commands and responses
+        without waiting for the compressor's internal buffer to fill.
+        """
+        if not data:
+            return
+        compressed = self._compressor.compress(data)
+        compressed += self._compressor.flush(zlib.Z_SYNC_FLUSH)
+        self._transport.write(compressed)
+
+    def writeSequence(self, iovec):
+        """
+        Compress and write a sequence of byte strings, keeping their
+        order within the single compressed stream.
+        """
+        self.write(b"".join(iovec))
+
+    def loseConnection(self):
+        self._transport.loseConnection()
+
+    def abortConnection(self):
+        self._transport.abortConnection()
+
+    def getPeer(self):
+        return self._transport.getPeer()
+
+    def getHost(self):
+        return self._transport.getHost()
+
+    @property
+    def disconnecting(self):
+        return self._transport.disconnecting
+
+    # IConsumer passthroughs, so producer/consumer backpressure keeps
+    # working exactly as it does on the unwrapped transport.
+    def registerProducer(self, producer, streaming):
+        self._transport.registerProducer(producer, streaming)
+
+    def unregisterProducer(self):
+        self._transport.unregisterProducer()
+
+    def pauseProducing(self):
+        self._transport.pauseProducing()
+
+    def resumeProducing(self):
+        self._transport.resumeProducing()
+
+    def stopProducing(self):
+        self._transport.stopProducing()
+
+    def __getattr__(self, name):
+        """
+        Delegate any other attribute (for example transport specific
+        helpers such as C{_pollProducer}) to the wrapped transport.
+        """
+        try:
+            transport = self.__dict__["_transport"]
+        except KeyError:
+            raise AttributeError(name)
+        return getattr(transport, name)
+
+
+class _CompressionMixin:
+    """
+    Shared implementation of the incoming side of the IMAP COMPRESS
+    extension (RFC 4978) for L{IMAP4Client} and L{IMAP4Server}.
+
+    While compression is active, every chunk received from the
+    transport is decompressed before it reaches the line and literal
+    parser.  L{_enableCompression} performs the seamless switch
+    immediately after the tagged OK response, replaying any compressed
+    octets that arrived in the same chunk as that response so that
+    ordering is preserved.
+    """
+
+    # The wrapping transport (and outgoing compressor) once COMPRESS
+    # has been negotiated; C{None} while the session is uncompressed.
+    _deflateTransport = None
+
+    # The zlib decompressor for incoming compressed octets.
+    _decompressor = None
+
+    # Set when the compressed stream has been found corrupt, so no
+    # further data is fed to the parser.
+    _compressionFailed = False
+
+    # True while the line receiver is processing data.  The receiver
+    # re-enters dataReceived with already decompressed plaintext (for
+    # example the remainder after an in-line literal), which must not
+    # pass through the decompressor again.
+    _receiving = False
+
+    def _failCompression(self):
+        """
+        Terminate the session after a corrupt compressed stream.
+
+        Once the stream is corrupt the session is unusable, so the
+        connection is closed immediately, without sending any further
+        commands or responses, and no more data reaches the parser
+        (RFC 4978, section 6).
+        """
+        self._compressionFailed = True
+        self._decompressor = None
+        log.err(None, "Corrupt IMAP COMPRESS=DEFLATE stream")
+        self.transport.loseConnection()
+
+    def _enableCompression(self, level=zlib.Z_DEFAULT_COMPRESSION):
+        """
+        Switch this connection to bidirectional DEFLATE compression.
+
+        Octets already buffered by the line receiver (which may be
+        compressed data delivered together with the tagged OK
+        response) are drained and decompressed, so no data is lost and
+        ordering is preserved across the switch.
+        """
+        if self._deflateTransport is not None:
+            return
+        pending = self.clearLineBuffer()
+        self._deflateTransport = _DeflateTransport(self.transport, level)
+        self.transport = self._deflateTransport
+        self._decompressor = zlib.decompressobj(-15)
+        if pending:
+            # These compressed octets arrived in the same chunk as the
+            # tagged response.  Decompress them explicitly and hand the
+            # plaintext to the outer line receiver frame, which parses
+            # it in order once the current line has been dispatched.
+            try:
+                decompressed = self._decompressor.decompress(pending)
+            except zlib.error:
+                self._failCompression()
+                return
+            basic.LineReceiver.dataReceived(self, decompressed)
+
+    def dataReceived(self, data):
+        if self._compressionFailed:
+            return
+        # Re-entrant calls from the line receiver (e.g. switching back
+        # to line mode after an in-line literal) carry plaintext and
+        # only need to go back through the parser.
+        if not self._receiving and self._decompressor is not None:
+            try:
+                data = self._decompressor.decompress(data)
+            except zlib.error:
+                self._failCompression()
+                return
+        self._receiving = True
+        try:
+            basic.LineReceiver.dataReceived(self, data)
+        finally:
+            self._receiving = False
+
+
 # Some constants to help define what an atom is and is not - see the grammar
 # section of the IMAP4 RFC - <https://tools.ietf.org/html/rfc3501#section-9>.
 # Some definitions (SP, CTL, DQUOTE) are also from the ABNF RFC -
@@ -595,7 +775,7 @@ _atomChars = bytes(ch for ch in range(0x100) if ch not in _nonAtomChars)
 
 
 @implementer(IMailboxListener)
-class IMAP4Server(basic.LineReceiver, policies.TimeoutMixin):
+class IMAP4Server(_CompressionMixin, basic.LineReceiver, policies.TimeoutMixin):
     """
     Protocol implementation for an IMAP4rev1 server.
 
@@ -674,6 +854,7 @@ class IMAP4Server(basic.LineReceiver, policies.TimeoutMixin):
                 cap[b"STARTTLS"] = None
         cap[b"NAMESPACE"] = None
         cap[b"IDLE"] = None
+        cap[b"COMPRESS"] = [b"DEFLATE"]
         return cap
 
     def connectionMade(self):
@@ -1221,6 +1402,31 @@ class IMAP4Server(basic.LineReceiver, policies.TimeoutMixin):
             self.sendNegativeResponse(tag, b"TLS not available")
 
     unauth_STARTTLS = (do_STARTTLS,)
+
+    def do_COMPRESS(self, tag, algorithm):
+        """
+        Handle a C{COMPRESS} command (RFC 4978).
+
+        On success the tagged OK response is sent while the session is
+        still uncompressed and the connection is switched to
+        bidirectional DEFLATE compression immediately afterwards.  On
+        failure compression is never enabled and the uncompressed
+        session is left completely untouched.
+        """
+        if self._deflateTransport is not None:
+            self.sendBadResponse(tag, b"COMPRESS is already active")
+        elif algorithm.upper() != b"DEFLATE":
+            self.sendBadResponse(
+                tag, b"Unsupported compression algorithm: " + algorithm
+            )
+        else:
+            # The OK response itself goes out uncompressed; everything
+            # after its terminating CRLF is compressed.
+            self.sendPositiveResponse(tag, b"DEFLATE compression activated")
+            self._enableCompression()
+
+    # RFC 4978: COMPRESS is only valid in the authenticated state.
+    auth_COMPRESS = (do_COMPRESS, arg_atom)
 
     def do_LOGIN(self, tag, user, passwd):
         if b"LOGINDISABLED" in self.capabilities():
@@ -2413,7 +2619,7 @@ TIMEOUT_ERROR = error.TimeoutError()
 
 
 @implementer(IMailboxListener)
-class IMAP4Client(basic.LineReceiver, policies.TimeoutMixin):
+class IMAP4Client(_CompressionMixin, basic.LineReceiver, policies.TimeoutMixin):
     """IMAP4 client protocol implementation
 
     @ivar state: A string representing the state the connection is currently
@@ -3011,6 +3217,41 @@ class IMAP4Client(basic.LineReceiver, policies.TimeoutMixin):
     def __ebLoginTLS(self, failure):
         log.err(failure)
         return failure
+
+    def compress(self):
+        """
+        Negotiate the IMAP COMPRESS extension using DEFLATE (RFC 4978).
+
+        On success the transport is switched to bidirectional DEFLATE
+        compression immediately after the server's tagged OK response;
+        the first command issued afterwards is the first compressed
+        octets.  If the server refuses with a NO or BAD response the
+        returned L{Deferred} fails and the uncompressed session is
+        left completely untouched.
+
+        @rtype: L{Deferred}
+        @return: A deferred which fires with the server's response
+            when compression has been activated, or which fails if the
+            server does not advertise the COMPRESS=DEFLATE extension
+            or compression is already active.
+        """
+        if self._deflateTransport is not None:
+            return defer.fail(IMAP4Exception("COMPRESS=DEFLATE is already active"))
+        if self._capCache is None or b"DEFLATE" not in (
+            self._capCache.get(b"COMPRESS") or ()
+        ):
+            return defer.fail(
+                IMAP4Exception("Server does not support the COMPRESS=DEFLATE extension")
+            )
+        d = self.sendCommand(Command(b"COMPRESS", b"DEFLATE"))
+        d.addCallback(self._cbCompressionStarted)
+        return d
+
+    def _cbCompressionStarted(self, result):
+        # The tagged OK response has been consumed uncompressed; from
+        # here on both directions carry raw DEFLATE data.
+        self._enableCompression()
+        return result
 
     def namespace(self):
         """

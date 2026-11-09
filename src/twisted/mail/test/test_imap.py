@@ -15,6 +15,7 @@ import functools
 import locale
 import os
 import uuid
+import zlib
 from collections import OrderedDict
 from io import BytesIO
 from itertools import chain
@@ -57,6 +58,23 @@ except ImportError:
 
 def strip(f):
     return lambda result, f=f: f()
+
+
+def _deflate(data, level=zlib.Z_DEFAULT_COMPRESSION):
+    """
+    Compress C{data} with a raw DEFLATE stream flushed with
+    Z_SYNC_FLUSH, exactly as L{imap4._DeflateTransport} does.
+    """
+    compressor = zlib.compressobj(level, zlib.DEFLATED, -15)
+    return compressor.compress(data) + compressor.flush(zlib.Z_SYNC_FLUSH)
+
+
+def _inflate(data):
+    """
+    Decompress raw DEFLATE data produced by L{_deflate}.
+    """
+    decompressor = zlib.decompressobj(-15)
+    return decompressor.decompress(data) + decompressor.flush()
 
 
 class IMAP4UTF7Tests(TestCase):
@@ -1950,7 +1968,12 @@ class IMAP4ServerTests(IMAP4HelperMixin, TestCase):
 
         d1 = self.connected.addCallback(strip(getCaps)).addErrback(self._ebGeneral)
         d = defer.gatherResults([self.loopback(), d1])
-        expected = {b"IMAP4rev1": None, b"NAMESPACE": None, b"IDLE": None}
+        expected = {
+            b"IMAP4rev1": None,
+            b"NAMESPACE": None,
+            b"IDLE": None,
+            b"COMPRESS": [b"DEFLATE"],
+        }
         return d.addCallback(lambda _: self.assertEqual(expected, caps))
 
     def testCapabilityWithAuth(self):
@@ -1971,6 +1994,7 @@ class IMAP4ServerTests(IMAP4HelperMixin, TestCase):
             b"IMAP4rev1": None,
             b"NAMESPACE": None,
             b"IDLE": None,
+            b"COMPRESS": [b"DEFLATE"],
             b"AUTH": [b"CRAM-MD5"],
         }
 
@@ -7376,6 +7400,424 @@ class TLSTests(IMAP4HelperMixin, TestCase):
             self.assertIdentical(failures[0], imap4.IMAP4Exception)
 
         return self.loopback().addCallback(check)
+
+
+class DeflateTransportTests(SynchronousTestCase):
+    """
+    Tests for the write-side compression wrapper
+    L{imap4._DeflateTransport}.
+    """
+
+    def setUp(self):
+        self.underlying = StringTransport()
+        self.wrapper = imap4._DeflateTransport(self.underlying)
+
+    def test_interfaces(self):
+        """
+        The wrapper provides the transport and consumer surface relied
+        upon by the IMAP protocols.
+        """
+        verifyObject(interfaces.ITransport, self.wrapper)
+        verifyObject(interfaces.IConsumer, self.wrapper)
+
+    def test_writeProducesRawDeflate(self):
+        """
+        Written data is compressed with the header-less raw DEFLATE
+        format required by RFC 4978 and can be inflated again.
+        """
+        self.wrapper.write(b"hello world\r\n")
+        raw = self.underlying.value()
+        # A zlib-wrapped stream would start with 0x78; raw DEFLATE does
+        # not carry that header.
+        self.assertNotEqual(raw[:1], b"\x78")
+        self.assertEqual(_inflate(raw), b"hello world\r\n")
+
+    def test_writeAndWriteSequenceKeepOrder(self):
+        """
+        Multiple writes and write sequences share one compressor, so
+        their octets keep their order in a single continuous stream.
+        """
+        self.wrapper.write(b"a" * 100)
+        self.wrapper.write(b"b" * 100)
+        self.wrapper.writeSequence([b"c", b"d", b"e"])
+        self.assertEqual(
+            _inflate(self.underlying.value()),
+            b"a" * 100 + b"b" * 100 + b"cde",
+        )
+
+    def test_emptyWriteSendsNothing(self):
+        """
+        Empty writes do not push sync-flush padding onto the wire.
+        """
+        self.wrapper.write(b"")
+        self.assertEqual(self.underlying.value(), b"")
+
+    def test_loseConnectionPassthrough(self):
+        self.assertFalse(self.underlying.disconnecting)
+        self.wrapper.loseConnection()
+        self.assertTrue(self.underlying.disconnecting)
+
+    def test_addressPassthrough(self):
+        self.assertEqual(self.wrapper.getHost(), self.underlying.getHost())
+        self.assertEqual(self.wrapper.getPeer(), self.underlying.getPeer())
+
+    def test_producerBackpressurePassthrough(self):
+        """
+        Producer registration and flow control are forwarded to the
+        underlying transport so backpressure behaves unchanged.
+        """
+        producer = object()
+        self.wrapper.registerProducer(producer, False)
+        self.assertIdentical(self.underlying.producer, producer)
+        self.wrapper.pauseProducing()
+        self.assertEqual(self.underlying.producerState, "paused")
+        self.wrapper.resumeProducing()
+        self.assertEqual(self.underlying.producerState, "producing")
+        self.wrapper.unregisterProducer()
+        self.assertIsNone(self.underlying.producer)
+
+    def test_stopProducingPassthrough(self):
+        producer = object()
+        self.wrapper.registerProducer(producer, True)
+        self.wrapper.stopProducing()
+        self.assertEqual(self.underlying.producerState, "stopped")
+
+    def test_otherAttributesDelegate(self):
+        """
+        Attributes not part of the wrapper surface (for example the
+        loopback transport's C{_pollProducer} helper) are delegated to
+        the wrapped transport.
+        """
+        self.underlying.specialValue = 42
+        self.assertEqual(self.wrapper.specialValue, 42)
+
+
+class ServerCompressionTests(SynchronousTestCase):
+    """
+    Tests for L{imap4.IMAP4Server}'s handling of the COMPRESS command
+    and compressed input, driven directly over a L{StringTransport}.
+    """
+
+    def setUp(self):
+        self.transport = StringTransport()
+        self.server = imap4.IMAP4Server()
+        self.server.makeConnection(self.transport)
+        self.greeting = self.transport.value()
+        self.transport.clear()
+        self.server.state = "auth"
+
+    def tearDown(self):
+        self.server.connectionLost(failure.Failure(error.ConnectionDone()))
+
+    def test_capabilityAdvertised(self):
+        """
+        COMPRESS=DEFLATE is advertised in the greeting and the
+        capability list.
+        """
+        self.assertIn(b"COMPRESS=DEFLATE", self.greeting)
+        self.assertIn(b"COMPRESS=DEFLATE", self.server.listCapabilities())
+
+    def test_successfulCompressionSwitchesTransport(self):
+        """
+        A successful COMPRESS sends an uncompressed tagged OK and only
+        then wraps the transport; afterwards commands arrive and
+        responses leave compressed.
+        """
+        self.server.lineReceived(b"a COMPRESS DEFLATE")
+        okResponse = self.transport.value()
+        self.assertTrue(okResponse.startswith(b"a OK"))
+        self.assertIsInstance(self.server.transport, imap4._DeflateTransport)
+
+        self.server.dataReceived(_deflate(b"b NOOP\r\n"))
+        wireAfterOk = self.transport.value()[len(okResponse) :]
+        self.assertEqual(
+            _inflate(wireAfterOk),
+            b"b OK NOOP No operation performed\r\n",
+        )
+
+    def test_compressedDataBatchedWithCommand(self):
+        """
+        Compressed octets delivered in the same chunk as the COMPRESS
+        command line are replayed through the decompressor in order,
+        with nothing lost or duplicated.
+        """
+        self.server.dataReceived(b"a COMPRESS DEFLATE\r\n" + _deflate(b"b NOOP\r\n"))
+        wire = self.transport.value()
+        okResponse, compressedResponses = wire.split(b"\r\n", 1)
+        self.assertTrue(okResponse.startswith(b"a OK"))
+        self.assertEqual(
+            _inflate(compressedResponses),
+            b"b OK NOOP No operation performed\r\n",
+        )
+
+    def test_byteByByteDecompression(self):
+        """
+        A compressed stream split into arbitrarily small TCP chunks is
+        reassembled by the decompressor.
+        """
+        self.server.lineReceived(b"a COMPRESS DEFLATE")
+        self.transport.clear()
+
+        for octet in iterbytes(_deflate(b"b NOOP\r\n")):
+            self.server.dataReceived(octet)
+
+        self.assertEqual(
+            _inflate(self.transport.value()),
+            b"b OK NOOP No operation performed\r\n",
+        )
+
+    def test_unknownAlgorithmRejected(self):
+        """
+        An unknown compression mechanism receives a BAD response and
+        leaves the uncompressed session fully functional.
+        """
+        self.server.lineReceived(b"a COMPRESS GZIP")
+        self.assertIn(b"a BAD", self.transport.value())
+        self.assertNotIsInstance(self.server.transport, imap4._DeflateTransport)
+
+        self.server.lineReceived(b"b NOOP")
+        self.assertTrue(
+            self.transport.value().endswith(b"b OK NOOP No operation performed\r\n")
+        )
+
+    def test_doubleCompressionRejected(self):
+        """
+        A second COMPRESS after compression is active receives a BAD
+        response and the existing compressed session is untouched.
+        """
+        self.server.lineReceived(b"a COMPRESS DEFLATE")
+        self.transport.clear()
+
+        self.server.dataReceived(_deflate(b"b COMPRESS DEFLATE\r\n"))
+        self.assertEqual(
+            _inflate(self.transport.value()),
+            b"b BAD COMPRESS is already active\r\n",
+        )
+        self.assertIsNotNone(self.server._deflateTransport)
+
+    def test_compressRejectedOutsideAuthenticatedState(self):
+        """
+        RFC 4978 only permits COMPRESS in the authenticated state, so
+        it is an unsupported command before authentication.
+        """
+        self.server.state = "unauth"
+        self.server.lineReceived(b"a COMPRESS DEFLATE")
+        self.assertIn(b"a BAD Unsupported command", self.transport.value())
+        self.assertNotIsInstance(self.server.transport, imap4._DeflateTransport)
+
+    def test_corruptCompressedDataClosesConnection(self):
+        """
+        Corrupt compressed data terminates the connection immediately
+        without further parsing or responses.
+        """
+        self.server.lineReceived(b"a COMPRESS DEFLATE")
+        self.transport.clear()
+
+        self.server.dataReceived(b"\x00\x01\x02not really deflate\xff")
+
+        self.assertTrue(self.transport.disconnecting)
+        self.assertTrue(self.flushLoggedErrors())
+        self.assertEqual(self.transport.value(), b"")
+
+        # Data arriving after the fatal error is discarded, not parsed.
+        self.server.dataReceived(_deflate(b"b NOOP\r\n"))
+        self.assertEqual(self.transport.value(), b"")
+
+
+class ClientCompressionTests(SynchronousTestCase):
+    """
+    Tests for L{imap4.IMAP4Client}'s COMPRESS negotiation and
+    compressed output, driven directly over a L{StringTransport}.
+    """
+
+    def setUp(self):
+        self.transport = StringTransport()
+        self.client = imap4.IMAP4Client()
+        self.client.makeConnection(self.transport)
+        self.client.dataReceived(
+            b"* OK [CAPABILITY IMAP4rev1 COMPRESS=DEFLATE] hello\r\n"
+        )
+        self.transport.clear()
+
+    def test_compressSendsCommandAndSwitches(self):
+        """
+        compress() issues the tagged COMPRESS command and switches the
+        transport once the tagged OK is consumed; subsequent commands
+        leave compressed.
+        """
+        d = self.client.compress()
+        self.assertEqual(self.transport.value(), b"0001 COMPRESS DEFLATE\r\n")
+
+        self.client.dataReceived(b"0001 OK DEFLATE active\r\n")
+        self.successResultOf(d)
+        self.assertIsInstance(self.client.transport, imap4._DeflateTransport)
+
+        self.client.noop()
+        compressedCommand = self.transport.value()[len(b"0001 COMPRESS DEFLATE\r\n") :]
+        self.assertEqual(_inflate(compressedCommand), b"0002 NOOP\r\n")
+
+    def test_compressedResponseBatchedWithOk(self):
+        """
+        Compressed response data arriving in the same chunk as the
+        tagged OK is buffered through the switch and still completes
+        the next command in order.
+        """
+        compressed = self.client.compress()
+        # NOOP is queued until the COMPRESS command finishes.
+        noop = self.client.noop()
+
+        self.client.dataReceived(
+            b"0001 OK DEFLATE active\r\n" + _deflate(b"0002 OK NOOP completed\r\n")
+        )
+
+        self.successResultOf(compressed)
+        self.successResultOf(noop)
+        # The queued NOOP was the first compressed command sent.
+        wire = self.transport.value()
+        plaintext, compressedCommand = wire.split(b"\r\n", 1)
+        self.assertEqual(plaintext, b"0001 COMPRESS DEFLATE")
+        self.assertEqual(_inflate(compressedCommand), b"0002 NOOP\r\n")
+
+    def test_rejectedCompressionLeavesSessionUncompressed(self):
+        """
+        A NO response fails the returned deferred without enabling
+        compression; the session continues in plain text.
+        """
+        d = self.client.compress()
+        self.client.dataReceived(b"0001 NO server refuses compression\r\n")
+
+        failure = self.failureResultOf(d)
+        failure.trap(imap4.IMAP4Exception)
+        self.assertNotIsInstance(self.client.transport, imap4._DeflateTransport)
+
+        self.client.noop()
+        self.assertEqual(
+            self.transport.value(),
+            b"0001 COMPRESS DEFLATE\r\n0002 NOOP\r\n",
+        )
+
+    def test_compressWithoutCapabilityFails(self):
+        """
+        compress() fails immediately without sending anything when the
+        server does not advertise COMPRESS=DEFLATE.
+        """
+        transport = StringTransport()
+        client = imap4.IMAP4Client()
+        client.makeConnection(transport)
+        client.dataReceived(b"* OK [CAPABILITY IMAP4rev1] hello\r\n")
+
+        d = client.compress()
+        failure = self.failureResultOf(d)
+        failure.trap(imap4.IMAP4Exception)
+        self.assertEqual(transport.value(), b"")
+
+    def test_doubleCompressionFails(self):
+        d = self.client.compress()
+        self.client.dataReceived(b"0001 OK DEFLATE active\r\n")
+        self.successResultOf(d)
+
+        second = self.client.compress()
+        failure = self.failureResultOf(second)
+        failure.trap(imap4.IMAP4Exception)
+
+    def test_corruptCompressedDataClosesConnection(self):
+        """
+        Corrupt data from the server terminates the connection at once
+        and no further data reaches the parser.
+        """
+        d = self.client.compress()
+        self.client.dataReceived(b"0001 OK DEFLATE active\r\n")
+        self.successResultOf(d)
+
+        self.client.dataReceived(b"\x00\x01\x02not really deflate\xff")
+
+        self.assertTrue(self.transport.disconnecting)
+        self.assertTrue(self.flushLoggedErrors())
+
+    def test_compressedLiteralResponse(self):
+        """
+        A literal response carried by the compressed stream is
+        reassembled by the line/literal parser, even when the stream
+        is split across arbitrary chunk boundaries.
+        """
+        d = self.client.compress()
+        self.client.dataReceived(b"0001 OK DEFLATE active\r\n")
+        self.successResultOf(d)
+
+        fetch = self.client.fetchMessage("1:*")
+        stream = _deflate(
+            b"* 1 FETCH (RFC822 {24}\r\n"
+            b"Subject: first subject\r\n"
+            b" FLAGS (\\Seen))\r\n"
+            b"0002 OK FETCH completed\r\n"
+        )
+        # Deliver the single compressed response in arbitrary pieces.
+        self.client.dataReceived(stream[:7])
+        self.client.dataReceived(stream[7:])
+
+        self.assertEqual(
+            self.successResultOf(fetch),
+            {1: {"RFC822": "Subject: first subject\r\n"}},
+        )
+
+
+class CompressionLoopbackTests(IMAP4HelperMixin, TestCase):
+    """
+    End to end COMPRESS=DEFLATE sessions between the real
+    L{imap4.IMAP4Server} and L{imap4.IMAP4Client}, including literals
+    and producer backpressure.
+    """
+
+    def _runSession(self, pumpPolicy=None):
+        SimpleServer.theAccount.addMailbox(b"inbox")
+        infile = util.sibpath(__file__, "rfc822.message")
+        with open(infile, "rb") as f:
+            messageBytes = f.read()
+
+        @defer.inlineCallbacks
+        def session():
+            yield self.client.login(b"testuser", b"password-test")
+            yield self.client.compress()
+            self.assertIsInstance(self.client.transport, imap4._DeflateTransport)
+            self.assertIsInstance(self.server.transport, imap4._DeflateTransport)
+
+            yield self.client.noop()
+            yield self.client.select(b"inbox")
+            # APPEND streams a literal through FileProducer and thus
+            # exercises producer registration and backpressure across
+            # the compression wrapper.
+            yield self.client.append(b"inbox", BytesIO(messageBytes), (), None)
+            yield self.client.logout()
+
+        self.connected.addCallback(strip(session))
+        self.connected.addErrback(self._ebGeneral)
+        if pumpPolicy is None:
+            loopbackDeferred = self.loopback()
+        else:
+            loopbackDeferred = loopback.loopbackAsync(
+                self.server, self.client, pumpPolicy
+            )
+        return defer.gatherResults([loopbackDeferred, self.connected])
+
+    def test_endToEnd(self):
+        infile = util.sibpath(__file__, "rfc822.message")
+        with open(infile, "rb") as f:
+            messageBytes = f.read()
+        d = self._runSession()
+
+        def check(ignored):
+            mailbox = SimpleServer.theAccount.mailboxes["INBOX"]
+            self.assertEqual(len(mailbox.messages), 1)
+            self.assertEqual(mailbox.messages[0][0].getvalue(), messageBytes)
+
+        return d.addCallback(check)
+
+    def test_endToEndWithCollapsedPumpPolicy(self):
+        """
+        The session also works when outstanding wire chunks are
+        collapsed into single, arbitrarily sized deliveries.
+        """
+        return self._runSession(loopback.collapsingPumpPolicy)
 
 
 class SlowMailbox(SimpleMailbox):
